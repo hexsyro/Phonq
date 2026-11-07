@@ -8,6 +8,7 @@
     "node": ">=20.9.0"
   },
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "next dev",
     "build": "prisma generate && next build",
     "start": "next start",

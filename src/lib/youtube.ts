@@ -1083,22 +1083,34 @@ export async function fetchAllCachedVideos(limit = 100): Promise<YouTubeVideo[]>
   return findAllSongs(limit);
 }
 
-/** Cached YouTube songs by their raw video ids (no API calls). Primary source
- * is the `songs` store; videos that were resolved recently but pruned from or
- * never written to Postgres are recovered from the `song:{videoId}` read-through
- * cache, so saved history/favorites/playlists keep resolving. */
+/** Cached YouTube songs by their raw video ids. Primary source is the `songs`
+ * store; videos that were resolved recently but pruned from or never written to
+ * Postgres are recovered from the `song:{videoId}` read-through cache, so saved
+ * history/favorites/playlists keep resolving. Videos missing from both the DB
+ * and the read-through cache are fetched live via `videos.list` (1 unit per 50
+ * ids, budget-gated) so a saved track never silently vanishes. */
 export async function fetchVideosByIds(videoIds: string[]): Promise<YouTubeVideo[]> {
   const songs = await findSongsByIds(videoIds);
   for (const song of songs) cacheSetSong(song);
 
   const found = new Set(songs.map((s) => s.videoId));
-  const missing = [...new Set(videoIds.filter((id) => !found.has(id)))];
+  let missing = [...new Set(videoIds.filter((id) => !found.has(id)))];
   if (missing.length === 0) return songs;
 
   const cached = (
     await Promise.all(missing.map((id) => cacheGetSong(id).catch(() => null)))
   ).filter((v): v is YouTubeVideo => v != null);
-  return [...songs, ...cached];
+  const cachedIds = new Set(cached.map((v) => v.videoId));
+  missing = missing.filter((id) => !cachedIds.has(id));
+  if (missing.length === 0) return [...songs, ...cached];
+
+  // Still missing: fetch live metadata via the 1-unit-per-50-ids videos.list
+  // endpoint and persist the winners so later lookups are free reads.
+  const live = await videosList(missing);
+  for (const video of live) {
+    await persistSong(video, channelQuality(video.channelTitle));
+  }
+  return [...songs, ...cached, ...live];
 }
 
 /* ------------------------------------------------------------------ */

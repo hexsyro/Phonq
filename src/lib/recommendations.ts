@@ -93,6 +93,15 @@ interface Scored {
   slug: string | null;
 }
 
+/** Placeholder artist names that should never be capped (they group unrelated
+ * uploads rather than a single artist). */
+const GENERIC_ARTIST_NAMES = new Set([
+  "unknown artist",
+  "unknown",
+  "various artists",
+  "various",
+]);
+
 /** Greedily fill `picks` from the affinity-sorted pool, honouring per-subgenre
  * and per-artist caps. Counts of already-picked items are respected. */
 function fillWithCaps(
@@ -104,19 +113,30 @@ function fillWithCaps(
 ): Scored[] {
   const subgenreCount = new Map<string, number>();
   const artistCount = new Map<string, number>();
+  const picked = new Set<Scored>();
   for (const item of picks) {
     if (item.slug) subgenreCount.set(item.slug, (subgenreCount.get(item.slug) ?? 0) + 1);
-    if (item.track.artistName) artistCount.set(item.track.artistName, (artistCount.get(item.track.artistName) ?? 0) + 1);
+    const artist = item.track.artistName;
+    if (artist && !GENERIC_ARTIST_NAMES.has(artist.toLowerCase().trim())) {
+      artistCount.set(artist, (artistCount.get(artist) ?? 0) + 1);
+    }
+    picked.add(item);
   }
   for (const item of scored) {
     if (picks.length >= limit) break;
-    if (picks.includes(item)) continue;
+    if (picked.has(item)) continue;
     const overSubgenre = item.slug ? (subgenreCount.get(item.slug) ?? 0) >= subgenreCap : false;
-    const overArtist = item.track.artistName ? (artistCount.get(item.track.artistName) ?? 0) >= artistCap : false;
+    const artist = item.track.artistName;
+    const overArtist = artist && !GENERIC_ARTIST_NAMES.has(artist.toLowerCase().trim())
+      ? (artistCount.get(artist) ?? 0) >= artistCap
+      : false;
     if (overSubgenre || overArtist) continue;
     picks.push(item);
+    picked.add(item);
     if (item.slug) subgenreCount.set(item.slug, (subgenreCount.get(item.slug) ?? 0) + 1);
-    if (item.track.artistName) artistCount.set(item.track.artistName, (artistCount.get(item.track.artistName) ?? 0) + 1);
+    if (artist && !GENERIC_ARTIST_NAMES.has(artist.toLowerCase().trim())) {
+      artistCount.set(artist, (artistCount.get(artist) ?? 0) + 1);
+    }
   }
   return picks;
 }

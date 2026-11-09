@@ -25,14 +25,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   });
   if (existing) return conflict("Track is already in this playlist");
 
-  const nextPosition =
-    (await prisma.playlistTrack.aggregate({
-      where: { playlistId: id },
-      _max: { position: true },
-    }))._max.position ?? -1;
+  const entry = await prisma.$transaction(async (tx) => {
+    const nextPosition =
+      (await tx.playlistTrack.aggregate({
+        where: { playlistId: id },
+        _max: { position: true },
+      }))._max.position ?? -1;
 
-  const entry = await prisma.playlistTrack.create({
-    data: { playlistId: id, trackId: body.trackId, position: nextPosition + 1 },
+    return tx.playlistTrack.create({
+      data: { playlistId: id, trackId: body.trackId, position: nextPosition + 1 },
+    });
   });
 
   await prisma.playlist.update({

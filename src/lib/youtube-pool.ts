@@ -134,10 +134,14 @@ export async function usage(projectId: number, op: OpType): Promise<number> {
   return ytRedis.readCounter(counterKey(projectId, op));
 }
 
+let rrIndex = 0;
+
 /**
  * Pick the least-loaded project that still has room for `op`, or null when the
  * pool is exhausted. Reads today's per-project counter and applies a small
  * safety margin so a quota rejection (403/429) never stalls the last slot.
+ * Rotates round-robin among low-usage projects so concurrent requests don't
+ * cluster on project 0.
  * `markProjectExhausted` charges a rejected project's headroom so this helper
  * stops selecting it for the rest of the day.
  */
@@ -150,7 +154,14 @@ export async function getAvailableProject(op: OpType): Promise<Project | null> {
   const usable = withUsage
     .filter(({ p, used }) => used + cost <= p.dailyLimit - margin)
     .sort((a, b) => a.used - b.used);
-  return usable[0]?.p ?? null;
+  if (usable.length === 0) return null;
+
+  // Round-robin among projects with usage close to the minimum to distribute concurrent load evenly
+  const minUsage = usable[0].used;
+  const candidates = usable.filter((u) => u.used <= minUsage + cost * 2);
+  const picked = candidates[rrIndex % candidates.length];
+  rrIndex = (rrIndex + 1) % 100000;
+  return picked.p;
 }
 
 /**

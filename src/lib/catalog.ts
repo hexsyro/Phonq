@@ -532,7 +532,8 @@ async function fetchCuratedCandidates(
   desired: number,
 ): Promise<Track[]> {
   const candidates: Track[] = [];
-  for (const offset of [0, 100]) {
+  let offset = 0;
+  while (candidates.length < desired) {
     const batch = await jamendo.fetchTracks({
       search: params.search,
       tags: params.tags,
@@ -541,9 +542,11 @@ async function fetchCuratedCandidates(
       limit: 100,
       offset,
     });
+    if (batch.length === 0) break;
     await cacheTracks(batch);
     candidates.push(...curatedTracks(batch, { subgenre: params.subgenre }));
-    if (batch.length < 100 || candidates.length >= desired) break;
+    if (batch.length < 100) break;
+    offset += 100;
   }
   return candidates;
 }

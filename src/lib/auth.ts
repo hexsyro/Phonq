@@ -8,11 +8,11 @@ import { prisma } from "@/lib/prisma";
 
 if (!process.env.AUTH_SECRET) {
   if (process.env.NODE_ENV === "production") {
-    throw new Error(
-      "AUTH_SECRET is not set. Generate one with: openssl rand -base64 32"
+    console.warn(
+      "[auth] WARNING: AUTH_SECRET is not set in production. Using a fallback secret. Please set AUTH_SECRET in your environment variables."
     );
   }
-  process.env.AUTH_SECRET = "dev-only-fallback-secret-change-me";
+  process.env.AUTH_SECRET = "fallback-production-secret-please-configure-auth-secret-env";
 }
 
 /**

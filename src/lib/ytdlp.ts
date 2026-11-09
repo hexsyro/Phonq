@@ -69,7 +69,7 @@ export async function downloadYouTubeAudio(videoId: string, timeoutMs = 90_000):
 
 function runYtDlp(args: string[], timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child: YtDlpProcess = spawn(YTDLP_BINARY, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child: YtDlpProcess = spawn(YTDLP_BINARY, args, { stdio: ["ignore", "pipe", "pipe"] } /*turbopackIgnore: true*/);
     let stderr = "";
     let settled = false;
 

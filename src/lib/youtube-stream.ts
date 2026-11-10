@@ -45,6 +45,22 @@ interface CacheEntry {
 
 /** Deciphered URLs expire server-side (~6h), so a 30-minute TTL is plenty. */
 const urlCache = new Map<string, CacheEntry>();
+const URL_CACHE_MAX = 1024;
+
+/** Evict expired entries and, if still at capacity, the oldest ones (insertion
+ * order). Keeps the cache bounded in long-running servers. */
+function sweepUrlCache(): void {
+  if (urlCache.size < URL_CACHE_MAX) return;
+  const now = Date.now();
+  for (const [key, entry] of urlCache) {
+    if (entry.expiresAt <= now) urlCache.delete(key);
+  }
+  while (urlCache.size >= URL_CACHE_MAX) {
+    const oldest = urlCache.keys().next();
+    if (oldest.done) break;
+    urlCache.delete(oldest.value);
+  }
+}
 
 /** Drop a cached stream URL so the next request re-extracts (used when the
  * upstream proxy fetch fails — googlevideo URLs can be revoked before TTL). */
@@ -165,6 +181,7 @@ export async function extractStreamUrl(videoId: string): Promise<ExtractedStream
     result = await extractWithYtDlp(videoId);
   }
 
+  sweepUrlCache();
   urlCache.set(videoId, {
     url: result.url,
     mimeType: result.mimeType,

@@ -186,6 +186,12 @@ export async function getCatalogStatus(): Promise<CatalogStatusShape> {
 function freshCacheIds(ids: string[]): string[] {
   const map = globalForCatalog.__phonqCacheWrites ?? (globalForCatalog.__phonqCacheWrites = new Map());
   const now = Date.now();
+  if (map.size >= 10_000) {
+    // Bound the per-id write-throttle map in long-running processes.
+    for (const [key, at] of map) {
+      if (now - at > CACHE_WRITE_TTL_MS) map.delete(key);
+    }
+  }
   return ids.filter((id) => {
     const at = map.get(id);
     if (at === undefined || now - at > CACHE_WRITE_TTL_MS) {

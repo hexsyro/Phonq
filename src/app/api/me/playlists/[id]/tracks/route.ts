@@ -18,24 +18,43 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   if (!playlist) return notFound("Playlist not found");
 
   const body = (await request.json().catch(() => ({}))) as { trackId?: string };
-  if (!body.trackId) return badRequest("trackId is required");
+  const trackId = body.trackId;
+  if (!trackId) return badRequest("trackId is required");
 
   const existing = await prisma.playlistTrack.findUnique({
-    where: { playlistId_trackId: { playlistId: id, trackId: body.trackId } },
+    where: { playlistId_trackId: { playlistId: id, trackId } },
   });
   if (existing) return conflict("Track is already in this playlist");
 
-  const entry = await prisma.$transaction(async (tx) => {
-    const nextPosition =
-      (await tx.playlistTrack.aggregate({
-        where: { playlistId: id },
-        _max: { position: true },
-      }))._max.position ?? -1;
+  // Compute the next position and insert atomically. Under SERIALIZABLE
+  // isolation Postgres aborts one of two concurrent transactions with a
+  // serialization failure (P2034) — retry the whole thing a few times so a
+  // concurrent add to the same playlist can't duplicate positions.
+  const MAX_RETRIES = 3;
+  let entry;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      entry = await prisma.$transaction(
+        async (tx) => {
+          const nextPosition =
+            (await tx.playlistTrack.aggregate({
+              where: { playlistId: id },
+              _max: { position: true },
+            }))._max.position ?? -1;
 
-    return tx.playlistTrack.create({
-      data: { playlistId: id, trackId: body.trackId, position: nextPosition + 1 },
-    });
-  });
+          return tx.playlistTrack.create({
+            data: { playlistId: id, trackId, position: nextPosition + 1 },
+          });
+        },
+        { isolationLevel: "Serializable" },
+      );
+      break;
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === "P2034" && attempt < MAX_RETRIES) continue;
+      throw err;
+    }
+  }
 
   await prisma.playlist.update({
     where: { id },

@@ -548,12 +548,33 @@ describe("resolveSongVideo", () => {
     expect(redisMock.ytRedis.cacheSet).toHaveBeenCalledWith(expect.stringMatching(/^search:/), "live1", SEARCH_CACHE_TTL);
   });
 
-  it("negative-caches the query when the pool is exhausted and no DB match exists", async () => {
-    poolMock.getAvailableProject.mockResolvedValue(null);
+  it("negative-caches the query when a live search runs but nothing passes the relevance floor", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(String(input));
+        const isSearch = url.pathname.endsWith("/search");
+        const body = isSearch
+          ? { items: [{ id: { videoId: "z1" }, snippet: { title: "Totally Unrelated Video", channelTitle: "Somebody - Random", thumbnails: { medium: { url: "u" } } } }] }
+          : { items: [{ id: "z1", snippet: { title: "Totally Unrelated Video", channelTitle: "Somebody - Random" }, contentDetails: { duration: "PT2M30S" }, status: { embeddable: true } }] };
+        return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+      }),
+    );
 
     const video = await resolveSongVideo("Missing Song", "Nobody");
     expect(video).toBeNull();
     expect(redisMock.ytRedis.cacheSet).toHaveBeenCalledWith(expect.stringMatching(/^neg:/), "1", NEG_CACHE_TTL);
+    expect(dbMock.upsertSong).not.toHaveBeenCalled();
+  });
+
+  it("does not negative-cache the query when the search pool is exhausted", async () => {
+    // Pool exhaustion says nothing about whether the song exists — negative-
+    // caching here would poison the query for 2h after the API recovers.
+    poolMock.getAvailableProject.mockResolvedValue(null);
+
+    const video = await resolveSongVideo("Missing Song", "Nobody");
+    expect(video).toBeNull();
+    expect(redisMock.ytRedis.cacheSet).not.toHaveBeenCalledWith(expect.stringMatching(/^neg:/), "1", NEG_CACHE_TTL);
     expect(dbMock.upsertSong).not.toHaveBeenCalled();
   });
 });

@@ -179,6 +179,11 @@ const globalForYouTube = globalThis as unknown as {
 function markSearch(key: string): boolean {
   const map = globalForYouTube.__phonqYouTubeSearches ?? (globalForYouTube.__phonqYouTubeSearches = new Map());
   const now = Date.now();
+  if (map.size >= 1024) {
+    for (const [k, at] of map) {
+      if (now - at >= 60 * 1000) map.delete(k);
+    }
+  }
   const last = map.get(key) ?? 0;
   if (now - last < 60 * 1000) return false;
   map.set(key, now);
@@ -646,6 +651,13 @@ async function persistSong(video: YouTubeVideo, qualityScore: number): Promise<v
 /* search.list + ranking                                               */
 /* ------------------------------------------------------------------ */
 
+/** Outcome of a live search, so callers can distinguish "searched, nothing
+ * good found" (negative-cache it) from "the API/pool failed" (retry later). */
+export type SongSearchOutcome =
+  | { kind: "hit"; video: YouTubeVideo }
+  | { kind: "miss" }
+  | { kind: "error" };
+
 /**
  * Run a real `search.list` call (100 units) for a song, rank the candidates
  * via the layered scoring pipeline (videoCategoryId=10 already applied at the
@@ -656,7 +668,7 @@ async function searchAndCache(
   songTitle: string,
   artistName: string,
   subgenre?: string,
-): Promise<YouTubeVideo | null> {
+): Promise<SongSearchOutcome> {
   const artist = normalizeKey(artistName);
   const queries = [
     artistName && songTitle ? `${artistName} ${songTitle}` : songTitle,
@@ -677,7 +689,7 @@ async function searchAndCache(
     },
     "search",
   );
-  if (!data?.items) return null;
+  if (!data?.items) return { kind: "error" };
 
   // Fetch fresh metadata (duration, embed status, topic categories) for every
   // candidate in one 1-unit batched videos.list call, then score them all.
@@ -706,12 +718,12 @@ async function searchAndCache(
       source: "search",
     }];
   });
-  if (allMetas.length === 0) return null;
+  if (allMetas.length === 0) return { kind: "miss" };
 
   const channels = await channelStats([...new Set(allMetas.map((m) => m.channelId).filter((x): x is string => Boolean(x)))]);
   const ranked = rankCandidates(items, allMetas, channels, songTitle, artistName, subgenre);
   const best = ranked[0];
-  if (!best) return null;
+  if (!best) return { kind: "miss" };
 
   const video: YouTubeVideo = {
     ...best,
@@ -724,7 +736,7 @@ async function searchAndCache(
 
   await persistSong(video, winnerQuality(best.score));
   video.thumbnail = thumbnailFor(video.videoId);
-  return video;
+  return { kind: "hit", video };
 }
 
 /* ------------------------------------------------------------------ */
@@ -794,15 +806,19 @@ export async function resolveSongVideo(
   const dedupeKey = `${songKey}|${artistKey}`;
   if (!markSearch(dedupeKey)) return null;
 
-  const video = await searchAndCache(songTitle, artistName, subgenre);
-  if (video) {
-    void ytRedis.cacheSet(cacheKey, video.videoId, SEARCH_CACHE_TTL);
-    void touchLastPlayed(video.videoId);
-    return video;
+  const outcome = await searchAndCache(songTitle, artistName, subgenre);
+  if (outcome.kind === "hit") {
+    void ytRedis.cacheSet(cacheKey, outcome.video.videoId, SEARCH_CACHE_TTL);
+    void touchLastPlayed(outcome.video.videoId);
+    return outcome.video;
   }
 
-  // 4. Nothing good — negative-cache so this query isn't retried for 2h.
-  void ytRedis.cacheSet(`neg:${cacheKey}`, "1", NEG_CACHE_TTL);
+  // 4. Negative-cache ONLY when the search executed and found nothing usable.
+  // Pool exhaustion / upstream errors must not poison the query for 2h — the
+  // song may resolve fine on the next attempt once the API recovers.
+  if (outcome.kind === "miss") {
+    void ytRedis.cacheSet(`neg:${cacheKey}`, "1", NEG_CACHE_TTL);
+  }
   return null;
 }
 
@@ -821,6 +837,16 @@ export function runtimeFillEnabled(): boolean {
   return !["0", "false", "off", "no"].includes(value);
 }
 
+/** Drop entries older than `maxAgeMs` once the map is large, so these
+ * long-lived process-local throttles don't grow without bound. */
+function pruneOlderThan(map: Map<string, number>, maxAgeMs: number): void {
+  if (map.size < 1024) return;
+  const now = Date.now();
+  for (const [key, at] of map) {
+    if (now - at >= maxAgeMs) map.delete(key);
+  }
+}
+
 function genreFillDue(subgenre: string): boolean {
   const now = Date.now();
   const last = genreFillAt.get(subgenre) ?? 0;
@@ -828,6 +854,7 @@ function genreFillDue(subgenre: string): boolean {
 }
 
 function markGenreFill(subgenre: string): void {
+  pruneOlderThan(genreFillAt, GENRE_FILL_DEDUPE_MS);
   genreFillAt.set(subgenre, Date.now());
 }
 
@@ -871,6 +898,11 @@ export async function fetchGenreVideos(
 
   const found: YouTubeVideo[] = [];
   const seenIds = new Set<string>();
+  // Whether at least one live search call actually executed (API responded, not
+  // just an empty candidate filter). Used to gate the daily throttle below:
+  // an empty-but-real result means "searched, nothing good" and must not
+  // re-burn 100 units on the next page render.
+  let searchedLive = false;
 
   for (const query of queries.slice(0, 3)) {
     if (found.length >= limit) break;
@@ -888,6 +920,7 @@ export async function fetchGenreVideos(
       "search",
     );
     if (!data?.items) continue;
+    searchedLive = true;
 
     const candidates = data.items
       .filter((item) => {
@@ -923,7 +956,10 @@ export async function fetchGenreVideos(
     }
   }
 
-  if (found.length > 0) markGenreFill(subgenre);
+  // Mark the daily throttle whenever a live search actually ran — even if every
+  // candidate was dropped as junk/short/non-embeddable. Otherwise an empty
+  // genre re-spends the search budget on every page render.
+  if (searchedLive) markGenreFill(subgenre);
   return found.slice(0, limit);
 }
 
@@ -938,6 +974,7 @@ function queryFillDue(key: string): boolean {
 }
 
 function markQueryFill(key: string): void {
+  pruneOlderThan(queryFillAt, GENRE_FILL_DEDUPE_MS);
   queryFillAt.set(key, Date.now());
 }
 
@@ -967,6 +1004,10 @@ export async function fetchQueryVideos(query: string, limit = 12, subgenre?: str
     "search",
   );
   if (!data?.items) return [];
+  // The daily throttle must engage whenever a live search actually executed —
+  // even if every candidate was dropped — otherwise an empty result re-spends
+  // the search budget on every identical request.
+  markQueryFill(q.toLowerCase());
 
   const seenIds = new Set<string>();
   const candidates = data.items
@@ -1002,7 +1043,6 @@ export async function fetchQueryVideos(query: string, limit = 12, subgenre?: str
     if (found.length >= limit) break;
    }
 
-  if (found.length > 0) markQueryFill(q.toLowerCase());
   return found;
 }
 

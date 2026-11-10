@@ -56,9 +56,30 @@ export async function POST(request: Request) {
       },
     });
   } else {
-    await prisma.listen.create({
-      data: { userId: session.user.id, trackId: body.trackId, progress, completed },
-    });
+    try {
+      await prisma.listen.create({
+        data: { userId: session.user.id, trackId: body.trackId, progress, completed },
+      });
+    } catch (err) {
+      // Two concurrent plays for the same (user, track) raced past findFirst.
+      // The loser of the unique(userId, trackId) constraint retries as an
+      // update instead of turning the user's listen into a 500.
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== "P2002") throw err;
+      const winner = await prisma.listen.findFirst({
+        where: { userId: session.user.id, trackId: body.trackId },
+      });
+      if (winner) {
+        await prisma.listen.update({
+          where: { id: winner.id },
+          data: {
+            progress: Math.max(winner.progress, progress),
+            completed: winner.completed || completed,
+            listenedAt: new Date(),
+          },
+        });
+      }
+    }
   }
 
   // Keep played YouTube videos resolvable (see the comment above).

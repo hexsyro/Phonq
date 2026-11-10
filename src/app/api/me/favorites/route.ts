@@ -40,10 +40,21 @@ export async function POST(request: Request) {
   });
   if (existing) return created({ favorite: existing });
 
-  const favorite = await prisma.favorite.create({
-    data: { userId: session.user.id, trackId: body.trackId },
-  });
-  return created({ favorite });
+  try {
+    const favorite = await prisma.favorite.create({
+      data: { userId: session.user.id, trackId: body.trackId },
+    });
+    return created({ favorite });
+  } catch (err) {
+    // Two concurrent likes for the same track raced past findUnique —
+    // return the winner's row instead of a 500 on the unique constraint.
+    const code = (err as { code?: string } | null)?.code;
+    if (code !== "P2002") throw err;
+    const favorite = await prisma.favorite.findUnique({
+      where: { userId_trackId: { userId: session.user.id, trackId: body.trackId } },
+    });
+    return created({ favorite });
+  }
 }
 
 export async function DELETE(request: Request) {

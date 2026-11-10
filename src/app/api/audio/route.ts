@@ -69,7 +69,10 @@ export async function GET(request: Request) {
     const contentRange = res.headers.get("content-range");
     if (contentRange) {
       headers.set("content-range", contentRange);
-      headers.set("content-length", String(Number(contentLength ?? 0)));
+      // Do NOT fabricate a content-length of "0" when the upstream serves the
+      // partial body without a content-length header (chunked transfer): the
+      // client would treat the range as empty and audio would fail to play.
+      if (contentLength) headers.set("content-length", contentLength);
       return new Response(res.body, { status: 206, headers });
     }
     if (contentLength) headers.set("content-length", contentLength);

@@ -80,7 +80,10 @@ export async function GET(request: Request) {
     const contentRange = res.headers.get("content-range");
     if (contentRange) {
       headers.set("content-range", contentRange);
-      headers.set("content-length", String(Number(contentLength ?? 0)));
+      // Do NOT fabricate a content-length of "0" when the upstream served the
+      // partial body with chunked transfer encoding (no content-length header):
+      // that makes the client believe the range is empty and breaks seeking.
+      if (contentLength) headers.set("content-length", contentLength);
       return new Response(res.body, { status: 206, headers });
     }
     if (contentLength) headers.set("content-length", contentLength);

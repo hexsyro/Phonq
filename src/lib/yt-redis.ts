@@ -131,16 +131,22 @@ class MemoryRedis implements RedisLike {
   }
 
   async incr(key: string): Promise<number> {
-    const cur = Number(this.store.get(key)?.value ?? 0) || 0;
+    // Expired entries must not carry forward — otherwise a stale quota bucket
+    // for yesterday keeps accumulating forever in the shim.
+    const alive = this.alive(key);
+    const cur = alive ? Number(this.store.get(key)!.value) || 0 : 0;
     const next = cur + 1;
-    this.store.set(key, { value: String(next), expiresAt: Infinity });
+    const expiresAt = alive ? this.store.get(key)!.expiresAt : Infinity;
+    this.store.set(key, { value: String(next), expiresAt });
     return next;
   }
 
   async incrby(key: string, amount: number): Promise<number> {
-    const cur = Number(this.store.get(key)?.value ?? 0) || 0;
+    const alive = this.alive(key);
+    const cur = alive ? Number(this.store.get(key)!.value) || 0 : 0;
     const next = cur + amount;
-    this.store.set(key, { value: String(next), expiresAt: Infinity });
+    const expiresAt = alive ? this.store.get(key)!.expiresAt : Infinity;
+    this.store.set(key, { value: String(next), expiresAt });
     return next;
   }
 
@@ -174,12 +180,22 @@ class MemoryRedis implements RedisLike {
   }
 }
 
-/** Best-effort Redis facade. Never throws; returns safe defaults on failure. */
+/** Re-probe Upstash at most every 30s while the backing Redis is offline, so
+ * the app recovers automatically instead of sticking to the shim forever. */
+const REPROBE_INTERVAL_MS = 30_000;
+
+/** Best-effort Redis facade. Never throws; serves from the in-memory shim
+ * while the configured Redis is down (quota counters and caches keep working
+ * instead of silently reading 0 / returning null), and recovers when Redis is
+ * back. Returns safe defaults when both fail. */
 export class YtRedis {
   /** True only when a real (networked) Upstash REST endpoint is configured. */
   readonly configured: boolean = Boolean(upstashUrl && upstashToken);
   private online = true;
   private inner: RedisLike;
+  /** In-process fallback used while the configured Redis is unreachable. */
+  private memory: RedisLike = new MemoryRedis();
+  private lastProbe = 0;
 
   /** In-process bandwidth meter — approximate payload bytes moved per op so the
    * monthly budget (Upstash 10 GB egress, roughly) is visible before the
@@ -213,17 +229,45 @@ export class YtRedis {
 
   /** Number of keys stored in Redis (DBSIZE) — 0 when down or unconfigured. */
   async dbSize(): Promise<number> {
-    return this.safe(() => this.inner.dbSize(), 0);
+    return this.safe((r) => r.dbSize(), 0);
   }
 
-  private async safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+  private async safe<T>(op: (inner: RedisLike) => Promise<T>, fallback: T): Promise<T> {
+    if (this.configured && !this.online) {
+      // Redis is down — re-probe at most once every REPROBE_INTERVAL_MS, then
+      // either flip back online or serve from the in-process shim. The shim
+      // keeps quota counters and the cache path working instead of silently
+      // degrading to 0/null (as documented in youtube-pool.ts).
+      if (Date.now() - this.lastProbe >= REPROBE_INTERVAL_MS) {
+        this.lastProbe = Date.now();
+        try {
+          await this.inner.ping();
+          this.online = true;
+        } catch {
+          return this.memoryRun(op, fallback);
+        }
+      } else {
+        return this.memoryRun(op, fallback);
+      }
+    }
     try {
-      return await fn();
+      return await op(this.inner);
     } catch (err) {
       this.online = false;
+      this.lastProbe = Date.now();
       if (upstashUrl) {
         console.warn(`[yt-redis] ${err instanceof Error ? err.message : String(err)}`);
       }
+      return this.memoryRun(op, fallback);
+    }
+  }
+
+  /** Run the same operation against the in-process shim; on failure, degrade to
+   * the provided fallback. */
+  private async memoryRun<T>(op: (inner: RedisLike) => Promise<T>, fallback: T): Promise<T> {
+    try {
+      return await op(this.memory);
+    } catch {
       return fallback;
     }
   }
@@ -243,8 +287,8 @@ export class YtRedis {
   /* ---- JSON caches: hot lookups + negative cache + song read-through ---- */
 
   async cacheGet<T = unknown>(key: string): Promise<T | null> {
-    return this.safe(async () => {
-      const raw = await this.inner.getString(key);
+    return this.safe(async (r) => {
+      const raw = await r.getString(key);
       this.stats.ops += 1;
       if (raw === null) {
         this.stats.misses += 1;
@@ -262,27 +306,27 @@ export class YtRedis {
   }
 
   async cacheSet<T>(key: string, value: T, ttlSec?: number): Promise<void> {
-    await this.safe(async () => {
+    await this.safe(async (r) => {
       const raw = typeof value === "string" ? value : JSON.stringify(value);
       this.stats.ops += 1;
       this.stats.writeBytes += key.length + raw.length;
-      await this.inner.setString(key, raw, ttlSec ? { ex: ttlSec } : undefined);
+      await r.setString(key, raw, ttlSec ? { ex: ttlSec } : undefined);
     }, undefined);
   }
 
   async cacheDel(key: string): Promise<void> {
-    await this.safe(async () => {
+    await this.safe(async (r) => {
       this.stats.ops += 1;
       this.stats.writeBytes += key.length;
-      await this.inner.del(key);
+      await r.del(key);
     }, undefined);
   }
 
   /* ---- Numeric counters: per-project quota budget + rate limiting ---- */
 
   async readCounter(key: string): Promise<number> {
-    return this.safe(async () => {
-      const raw = await this.inner.getString(key);
+    return this.safe(async (r) => {
+      const raw = await r.getString(key);
       this.stats.ops += 1;
       this.stats.readBytes += key.length + (raw?.length ?? 0);
       if (raw === null) return 0;
@@ -297,14 +341,14 @@ export class YtRedis {
    * gives natural midnight rollover; the 24h TTL is just a cleanup guard.
    */
   async incrCounter(key: string, amount: number, ttlSec: number): Promise<number> {
-    return this.safe(async () => {
+    return this.safe(async (r) => {
       this.stats.ops += 1;
       this.stats.writeBytes += key.length + String(amount).length;
-      const created = await this.inner.setString(key, String(amount), { ex: ttlSec, nx: true });
+      const created = await r.setString(key, String(amount), { ex: ttlSec, nx: true });
       if (created === "OK") return amount;
-      const next = await this.inner.incrby(key, amount);
+      const next = await r.incrby(key, amount);
       // Renew a TTL if one was lost (e.g. after a restart of an ephemeral store).
-      await this.inner.expire(key, ttlSec);
+      await r.expire(key, ttlSec);
       return next;
     }, amount);
   }

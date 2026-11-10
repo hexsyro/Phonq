@@ -134,14 +134,14 @@ export async function usage(projectId: number, op: OpType): Promise<number> {
   return ytRedis.readCounter(counterKey(projectId, op));
 }
 
-let rrIndex = 0;
-
 /**
  * Pick the least-loaded project that still has room for `op`, or null when the
- * pool is exhausted. Reads today's per-project counter and applies a small
- * safety margin so a quota rejection (403/429) never stalls the last slot.
- * Rotates round-robin among low-usage projects so concurrent requests don't
- * cluster on project 0.
+ * pool is exhausted. Reads today's per-project counter, applies a small safety
+ * margin so a quota rejection (403/429) never stalls the last slot, and reserves
+ * the unit cost immediately. Reserving at selection time is what stops a burst
+ * of concurrent requests from all landing on the same key before any of them
+ * has reported its usage back — the next reader sees the reservation and picks
+ * a different project.
  * `markProjectExhausted` charges a rejected project's headroom so this helper
  * stops selecting it for the rest of the day.
  */
@@ -153,15 +153,14 @@ export async function getAvailableProject(op: OpType): Promise<Project | null> {
   const withUsage = await Promise.all(pool.map(async (p) => ({ p, used: await usage(p.id, op) })));
   const usable = withUsage
     .filter(({ p, used }) => used + cost <= p.dailyLimit - margin)
-    .sort((a, b) => a.used - b.used);
-  if (usable.length === 0) return null;
-
-  // Round-robin among projects with usage close to the minimum to distribute concurrent load evenly
-  const minUsage = usable[0].used;
-  const candidates = usable.filter((u) => u.used <= minUsage + cost * 2);
-  const picked = candidates[rrIndex % candidates.length];
-  rrIndex = (rrIndex + 1) % 100000;
-  return picked.p;
+    .sort((a, b) => a.used - b.used || a.p.id - b.p.id);
+  const picked = usable[0]?.p;
+  if (!picked) return null;
+  // Reserve the units now; `recordUsage` only writes the ledger, so the Redis
+  // counter is charged exactly once per selection (conservatively, even if the
+  // upstream call later fails — cf. markProjectExhausted for 403/429).
+  await ytRedis.incrCounter(counterKey(picked.id, op), cost, 24 * 60 * 60);
+  return picked;
 }
 
 /**
@@ -182,9 +181,11 @@ export async function markProjectExhausted(projectId: number, op: OpType): Promi
   }
 }
 
-/** Atomically charge a project/op for a unit cost after a real API call. */
+/** Ledger-only bookkeeping after an API call. The unit reservation already
+ * happened in `getAvailableProject` (so concurrent selections spread across
+ * the pool), so this only records the call in Postgres and hands the Redis
+ * bandwidth meter to the daily ledger. */
 export async function recordUsage(projectId: number, op: OpType, units: number, endpoint: string): Promise<void> {
-  await ytRedis.incrCounter(counterKey(projectId, op), units, 24 * 60 * 60);
   await recordApiCall(projectId, endpoint, units);
   // Piggyback: hand the accumulated Redis bandwidth meter to the daily ledger
   // on each API call, so a runaway cache / quota job shows up in the logs

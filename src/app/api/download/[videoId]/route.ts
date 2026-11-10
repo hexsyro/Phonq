@@ -86,7 +86,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ vide
       fileStream.on("error", (err) => controller.error(err));
     },
     cancel() {
+      // Client disconnected mid-download — destroy the read stream and remove
+      // the temp dir, otherwise partial downloads accumulate on disk forever.
       fileStream.destroy();
+      cleanup();
     },
   });
 

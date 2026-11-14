@@ -181,7 +181,7 @@ the [security policy](SECURITY.md). In short:
 git clone https://github.com/hexsyro/Phonq
 cd Phonq && npm install
 # make your changes…
-npm run lint && npm run typecheck && npm test
+npm run lint && npm run typecheck && npm test && npm run ci
 ```
 
 Questions and ideas are welcome on

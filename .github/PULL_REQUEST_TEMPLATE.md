@@ -1,3 +1,5 @@
+<!-- Contributors: run the workflow tests before making pull requests. -->
+
 ## What does this PR do?
 
 A one-line summary of the change, plus what problem it solves.
@@ -12,6 +14,7 @@ Fixes #`<issue-number>` (or "Closes #…"). Delete this line if there's no issue
 - [ ] `npm run lint` passes
 - [ ] `npm run typecheck` passes
 - [ ] `npm test` passes (or I added tests for new logic)
+- [ ] The GitHub workflow tests pass (`npm run test:workflow` / `npm run ci` / green CI on this PR)
 - [ ] I tested the change locally (`npm run dev`)
 - [ ] Docs are updated if behaviour changed (README / docs / API reference)
 

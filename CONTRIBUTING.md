@@ -43,7 +43,16 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
+
+# run the full GitHub workflow test suite locally (mirrors CI)
+npm run test:workflow   # alias: npm run ci / npm run test:ci / npm run workflow:test
 ```
+
+The same checks run in the GitHub Actions workflow (`.github/workflows/ci.yml`) on every
+push and pull request, so run the workflow tests above before opening a PR to catch
+bugs early. Pull requests that fail the workflow tests cannot be merged.
+
+Contributors must run the workflow tests before make pull requests.
 
 - Keep changes focused. One feature/fix per PR.
 - Follow existing conventions (see "Conventions" in ARCHITECTURE.md): server components fetch data,
